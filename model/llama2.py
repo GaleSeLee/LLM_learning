@@ -60,12 +60,43 @@ def _initialize_affine_weight(weight: torch.Tensor, out_feeatures: int,
     return None
 
 class ColumnParallelLinear(torch.nn.Module):
-    def __init__(self, in_features:int, out_feeatures:int, bias:bool = True, 
+    def __init__(self, in_features:int, out_features:int, bias:bool = True, 
                  init_method: Callable[[torch.Tensor], torch.Tensor] = init.xavier_normal_, stride: int = 1, keep_master_weight_for_test: bool = False) -> None:
         super().__init__()
         self.in_features = in_features
-        self.out_feeatures = out_feeatures
+        self.out_features = out_features
         self.gather_output = gather_output         
+        world_size = get_model_parallel_world_size()
+        self.output_size_per_partition = devide_and_check_no_remainder(out_features, world_size)
+        self.weight = Parameter(torch.Tensor(self.output_size_per_partition, self.in_features))
+
+        if bias:
+            self.bias = Parameter(torch.Tensor(self.output_size_per_partition))
+            with torch.no_grad():
+                self.bias.zero_()
+        else:
+            self.register_parameter("bias", None)
+        self.master_weight = _initialize_affine_weight(
+            self.weight,
+            self.out_features,
+            self.in_features,
+            self.output_size_per_partition,
+            0,
+            init_method,
+            stride=stride,
+            return_master_weight=keep_master_weight_for_test,
+        )
+    def get_master_weight(self)->torch.Tensor:
+        return gather_from_model_parallel_region(self.weight.data.transpose(0,1)).transpose_(0,1)
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        input_parallel = copy_to_model_parallel_region(input_)
+        output_parallel = F.linear(input_parallel, self.weight, self.bias)
+        if self.gather_output:
+            output = gather_from_model_parallel_region(output_parallel)
+        else:
+            output = output_parallel
+        return output
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, n_kv_heads, head_dim = x.shape
